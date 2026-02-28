@@ -9,6 +9,28 @@
 
 ---
 
+## [v1.2.0] - 2026-02-28
+
+### 新增
+- `gps_state=3`：GPS 串口正常但模块超过 10 秒无 NMEA 输出时广播心跳（疑似模块故障）
+  - 触发阈值：`RTK_GPS_NO_DATA_TIMEOUT_MS = 10000`（10 秒，可调）
+  - 重连成功或收到 NMEA 后自动恢复正常广播
+- RTK 差分服务器运行时自动重连机制：连接中断后无需重启进程，自动指数退避重试
+  - 退避公式：`delay = BASE × FACTOR^(n-1)`，参数：BASE=3s，FACTOR=×1.6，上限 3 小时
+  - 连续 Tick 失败 10 次（`RTK_TICK_ERROR_THRESHOLD`）自动触发重连
+  - kill 进程后重启，重连计数从头清零
+
+### 变更
+- GPS 串口最大重连次数：5 次 → 20 次（`RTK_SERIAL_MAX_RECONNECT_COUNT`）
+- `broadcast_heartbeat()` 参数化：接受 `gps_state` 参数，支持 `gps_state=0` 和 `gps_state=3` 两种心跳
+
+### 文档
+- `RTK_Service_Process_Guide.md` 更新至 v1.2.0：新增 `gps_state=3` 说明、场景示例、接收端代码更新
+- 新增 `doc/RTK_SDK_Architecture.md`：工作流、状态机、线程模型、重连机制分析
+- 新增 `doc/RTK_SDK_FileMap.md`：所有文件作用说明
+
+---
+
 ## [v1.1.0] - 2026-02-28
 
 ### 新增

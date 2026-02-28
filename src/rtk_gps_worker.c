@@ -26,20 +26,21 @@
 typedef struct {
     pthread_t thread;                   /* 线程句柄 */
     int running;                        /* 运行标志 */
-    
+
     /* 接收缓冲区 */
     char recv_buf[4096];
     int recv_len;
     int buf_head;                       /* 优化：环形缓冲区头指针 */
-    
+
     /* 统计 */
     uint64_t nmea_recv_count;           /* NMEA接收计数 */
     uint64_t rtcm_sent_count;           /* RTCM发送计数 */
     uint64_t position_count;            /* 定位结果计数 */
     uint64_t reconnect_count;           /* 重连次数 */
 
-    /* 心跳 */
-    uint64_t last_broadcast_time;       /* 最近一次广播时间戳，用于串口断开时定时心跳 */
+    /* 心跳与超时检测 */
+    uint64_t last_broadcast_time;       /* 最近一次广播时间戳，用于定时心跳 */
+    uint64_t last_nmea_time;            /* 最近一次收到有效NMEA的时间戳，用于检测GPS模块静默 */
 } gps_worker_ctx_t;
 
 static gps_worker_ctx_t g_gps_worker = {0};
@@ -183,12 +184,15 @@ static void broadcast_position(const rtk_position_t *pos) {
 }
 
 /**
- * @brief 串口断开时广播心跳包，让接收端感知服务仍在运行
+ * @brief 广播无定位状态心跳包
  *
- * gps_state=0 表示 GPS 串口当前不可用（断开或重连中）
- * 位置数据全部为 0，接收端不应使用这些位置字段
+ * @param gps_state GPS 状态码：
+ *   0 = GPS 串口断开或未就绪（硬连接下极少发生）
+ *   3 = 串口正常但 GPS 模块无任何 NMEA 输出（疑似模块故障）
+ *
+ * 位置数据全部为 0，接收端不应使用位置字段。
  */
-static void broadcast_heartbeat(void) {
+static void broadcast_heartbeat(int gps_state) {
     /* 读取差分错误信息 */
     char diff_err_msg[128] = {0};
     pthread_mutex_lock(&g_rtk_ctx.callback_mutex);
@@ -201,7 +205,7 @@ static void broadcast_heartbeat(void) {
         "\"type\":\"rtk_position\","
         "\"diff_state\":%d,"
         "\"diff_err_msg\":\"%s\","
-        "\"gps_state\":0,"
+        "\"gps_state\":%d,"
         "\"lat\":0.0,"
         "\"lon\":0.0,"
         "\"alt\":0.0,"
@@ -212,6 +216,7 @@ static void broadcast_heartbeat(void) {
         "}",
         get_diff_state(),
         diff_err_msg,
+        gps_state,
         (unsigned long long)rtk_get_time_ms()
     );
 
@@ -220,7 +225,7 @@ static void broadcast_heartbeat(void) {
     }
 
     g_gps_worker.last_broadcast_time = rtk_get_time_ms();
-    RTK_LOGD("心跳广播: gps_state=0, diff_state=%d", get_diff_state());
+    RTK_LOGD("心跳广播: gps_state=%d, diff_state=%d", gps_state, get_diff_state());
 }
 
 /* ============================================================================
@@ -244,9 +249,9 @@ static void* gps_worker_thread(void *arg) {
         /* 检查串口状态，需要时重连 */
         rtk_serial_state_t state = rtk_serial_get_state();
         if (state == RTK_SERIAL_STATE_ERROR) {
-            /* 串口异常期间：定时广播心跳，让接收端感知服务仍在运行 */
+            /* 串口异常：定时广播心跳（gps_state=0），让接收端感知服务仍在运行 */
             if (now - g_gps_worker.last_broadcast_time >= RTK_GPS_HEARTBEAT_INTERVAL_MS) {
-                broadcast_heartbeat();
+                broadcast_heartbeat(0);
             }
             RTK_LOGW("检测到串口异常，尝试重连...");
             int ret = rtk_serial_reconnect();
@@ -256,17 +261,26 @@ static void* gps_worker_thread(void *arg) {
                 rtk_sleep_ms(RTK_SERIAL_RECONNECT_DELAY_MS);
                 continue;
             }
+            /* 重连成功，重置NMEA计时器（给模块启动时间） */
             g_gps_worker.reconnect_count++;
-            g_gps_worker.recv_len = 0;  /* 清空缓冲区 */
+            g_gps_worker.recv_len     = 0;
+            g_gps_worker.last_nmea_time = rtk_get_time_ms();
         } else if (state != RTK_SERIAL_STATE_OPEN) {
             /* 串口未就绪（初始化中/关闭中）：定时广播心跳 */
             if (now - g_gps_worker.last_broadcast_time >= RTK_GPS_HEARTBEAT_INTERVAL_MS) {
-                broadcast_heartbeat();
+                broadcast_heartbeat(0);
             }
             rtk_sleep_ms(100);
             continue;
         }
-        
+
+        /* GPS模块静默检测：串口正常但长时间无NMEA输出（疑似模块故障） */
+        if (g_gps_worker.last_nmea_time > 0 &&
+            now - g_gps_worker.last_nmea_time >= RTK_GPS_NO_DATA_TIMEOUT_MS &&
+            now - g_gps_worker.last_broadcast_time >= RTK_GPS_HEARTBEAT_INTERVAL_MS) {
+            broadcast_heartbeat(3);
+        }
+
         /* 从串口读取数据 */
         int n = rtk_serial_read(read_buf, sizeof(read_buf) - 1, 100);
         if (n < 0) {
@@ -333,6 +347,9 @@ static void* gps_worker_thread(void *arg) {
                     /* 无论 fix 是否有效都广播（接收端需要感知 gps_state） */
                     broadcast_position(&pos);
 
+                    /* 更新NMEA时间戳（用于GPS模块静默检测） */
+                    g_gps_worker.last_nmea_time = now;
+
                     /* 周期性日志（仅有效定位时记录） */
                     if (pos.fix_quality > 0 && now - last_log_time >= 5000) {
                         RTK_LOGI("RTK定位: %.8f, %.8f, 高度:%.2fm, 质量:%d, 卫星:%d",
@@ -396,7 +413,8 @@ int rtk_gps_worker_start(const char *port, int baudrate) {
     g_gps_worker.position_count = 0;
     g_gps_worker.reconnect_count = 0;
     g_gps_worker.last_broadcast_time = 0;  /* 置0使首次心跳立即触发 */
-    
+    g_gps_worker.last_nmea_time = rtk_get_time_ms(); /* 给模块启动预留10s缓冲 */
+
     ret = pthread_create(&g_gps_worker.thread, NULL, gps_worker_thread, NULL);
     if (ret != 0) {
         g_gps_worker.running = 0;

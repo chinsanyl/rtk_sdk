@@ -17,7 +17,7 @@
 
 /* 重连配置 */
 #define RTK_SERIAL_RECONNECT_DELAY_MS   2000    /* 重连延迟（毫秒） */
-#define RTK_SERIAL_MAX_RECONNECT_COUNT  5       /* 最大重连次数 */
+#define RTK_SERIAL_MAX_RECONNECT_COUNT  20      /* 最大重连次数 */
 #define RTK_SERIAL_ERROR_THRESHOLD      3       /* 连续错误阈值触发重连 */
 
 /**

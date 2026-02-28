@@ -153,126 +153,198 @@ int rtk_sixents_log_callback(const char *buff, unsigned short len) {
  * 工作线程
  * ========================================================================== */
 
-void* rtk_worker_thread(void *arg) {
-    (void)arg;
-    
-    sixents_sdkConf param;
-    int ret = 0;
-    int retry_count = 0;
-    uint64_t last_gga_time = 0;
-    
-    RTK_LOGI("工作线程启动");
-    
-    /* 初始化六分SDK配置 */
-    memset(&param, 0, sizeof(param));
-    param.keyType = SIXENTS_KEY_TYPE_AK;
-    memcpy(param.key, g_rtk_ctx.config.ak, strlen(g_rtk_ctx.config.ak));
-    memcpy(param.secret, g_rtk_ctx.config.as, strlen(g_rtk_ctx.config.as));
-    memcpy(param.devID, g_rtk_ctx.config.device_id, strlen(g_rtk_ctx.config.device_id));
-    memcpy(param.devType, g_rtk_ctx.config.device_type, strlen(g_rtk_ctx.config.device_type));
-    
-    param.timeout = (unsigned int)g_rtk_ctx.config.timeout_sec;
-    param.sockIOBlockFlag = SIXENTS_SOCK_IOFLAG_NOBLOCK;
-    param.logPrintLevel = SIXENTS_LL_DEBUG;
-    
-    /* 回调函数 */
-    param.cbGetDiffData = (sixents_cbGetDiffData)rtk_sixents_diff_callback;
-    param.cbGetStatus = (sixents_cbGetStatus)rtk_sixents_status_callback;
-    param.cbTrace = (sixents_cbTrace)rtk_sixents_log_callback;
-    
-    /* 初始化六分SDK */
-    while (g_rtk_ctx.worker_running && !g_rtk_ctx.sixents_init) {
-        ret = sixents_sdkInit(&param);
-        if (ret == SIXENTS_RET_OK) {
-            g_rtk_ctx.sixents_init = 1;
-            RTK_LOGI("六分SDK初始化成功");
-            break;
-        } else {
-            RTK_LOGE("六分SDK初始化失败: %d, 重试 %d/%d", ret, retry_count + 1, RTK_MAX_RETRY_COUNT);
-            sixents_sdkFinal();
-            retry_count++;
-            if (retry_count >= RTK_MAX_RETRY_COUNT) {
-                rtk_dispatch_error(RTK_ERR_SIXENTS_INIT, "六分SDK初始化失败", 0);
-                goto exit;
-            }
-            rtk_sleep_ms(RTK_RECONNECT_DELAY_MS);
+/**
+ * @brief 计算退避等待时间（毫秒）
+ *
+ * 公式：delay = BASE * FACTOR^(attempt-1)，上限为 MAX
+ * 整数迭代实现，无需浮点运算。
+ *
+ * 示例（BASE=3000ms, FACTOR=160即×1.6, MAX=10800000ms即3h）：
+ *   第1次: 3s, 第2次: ~5s, 第5次: ~12s, 第10次: ~55s, 第20次+: 3h
+ */
+static uint32_t calc_backoff_ms(int attempt) {
+    uint32_t delay_ms = RTK_RECONNECT_BASE_MS;
+    for (int i = 1; i < attempt; i++) {
+        /* delay *= FACTOR / 100，避免浮点 */
+        uint64_t next = (uint64_t)delay_ms * RTK_RECONNECT_FACTOR / 100;
+        if (next >= RTK_RECONNECT_MAX_MS) {
+            return RTK_RECONNECT_MAX_MS;
         }
+        delay_ms = (uint32_t)next;
     }
-    
-    /* 启动六分SDK */
-    retry_count = 0;
-    while (g_rtk_ctx.worker_running && !g_rtk_ctx.sixents_started) {
-        ret = sixents_sdkStart();
-        if (ret == SIXENTS_RET_OK) {
-            g_rtk_ctx.sixents_started = 1;
-            RTK_LOGI("六分SDK启动成功");
-            
-            /* 更新状态 */
-            pthread_mutex_lock(&g_rtk_ctx.state_mutex);
-            g_rtk_ctx.state = RTK_STATE_RUNNING;
-            pthread_mutex_unlock(&g_rtk_ctx.state_mutex);
+    return delay_ms;
+}
 
-            /* 连接成功，清除之前的错误信息 */
-            pthread_mutex_lock(&g_rtk_ctx.callback_mutex);
-            g_rtk_ctx.last_error_code = 0;
-            g_rtk_ctx.last_error_msg[0] = '\0';
-            pthread_mutex_unlock(&g_rtk_ctx.callback_mutex);
-
-            rtk_dispatch_status(RTK_STATE_RUNNING, 0);
-            break;
-        } else {
-            RTK_LOGE("六分SDK启动失败: %d, 重试 %d/%d", ret, retry_count + 1, RTK_MAX_RETRY_COUNT);
-            retry_count++;
-            if (retry_count >= RTK_MAX_RETRY_COUNT) {
-                rtk_dispatch_error(RTK_ERR_SIXENTS_START, "六分SDK启动失败", 0);
-                goto exit;
-            }
-            rtk_sleep_ms(RTK_RECONNECT_DELAY_MS);
-        }
-    }
-    
-    /* 主循环 */
+/**
+ * @brief 可中断的等待（每200ms检查一次 worker_running 标志）
+ */
+static void sleep_interruptible(uint32_t total_ms) {
+    uint64_t t0 = rtk_get_time_ms();
     while (g_rtk_ctx.worker_running) {
-        rtk_sleep_ms(RTK_TICK_INTERVAL_MS);
-        
-        /* 发送GGA数据 */
-        uint64_t now = rtk_get_time_ms();
-        if (now - last_gga_time >= RTK_GGA_INTERVAL_MS) {
-            pthread_mutex_lock(&g_rtk_ctx.gga_mutex);
-            if (g_rtk_ctx.gga_ready && g_rtk_ctx.gga_len > 0) {
-                ret = sixents_sdkSendGGAStr(g_rtk_ctx.gga_buffer, (unsigned short)g_rtk_ctx.gga_len);
-                if (ret == SIXENTS_RET_OK) {
-                    g_rtk_ctx.gga_send_count++;
-                    RTK_LOGD("发送GGA成功");
-                } else {
-                    RTK_LOGW("发送GGA失败: %d", ret);
-                }
-            }
-            pthread_mutex_unlock(&g_rtk_ctx.gga_mutex);
-            last_gga_time = now;
-        }
-        
-        /* 驱动SDK执行 */
-        ret = sixents_sdkTick();
-        if (ret != SIXENTS_RET_OK) {
-            RTK_LOGW("sixents_sdkTick失败: %d", ret);
-        }
+        if (rtk_get_time_ms() - t0 >= total_ms) break;
+        rtk_sleep_ms(200);
     }
-    
-exit:
-    /* 停止六分SDK */
+}
+
+/**
+ * @brief 停止并注销六分SDK（内部辅助函数）
+ */
+static void sixents_cleanup(void) {
     if (g_rtk_ctx.sixents_started) {
         sixents_sdkStop();
         g_rtk_ctx.sixents_started = 0;
         RTK_LOGI("六分SDK已停止");
     }
-    
     if (g_rtk_ctx.sixents_init) {
         sixents_sdkFinal();
         g_rtk_ctx.sixents_init = 0;
         RTK_LOGI("六分SDK已注销");
     }
-    
+}
+
+void* rtk_worker_thread(void *arg) {
+    (void)arg;
+
+    sixents_sdkConf param;
+    int ret = 0;
+    int reconnect_count = 0;    /* 当前重连次数，成功后归零 */
+    uint64_t last_gga_time = 0;
+
+    RTK_LOGI("工作线程启动");
+
+    /* 初始化六分SDK配置（一次性，重连时复用） */
+    memset(&param, 0, sizeof(param));
+    param.keyType = SIXENTS_KEY_TYPE_AK;
+    memcpy(param.key,     g_rtk_ctx.config.ak,          strlen(g_rtk_ctx.config.ak));
+    memcpy(param.secret,  g_rtk_ctx.config.as,          strlen(g_rtk_ctx.config.as));
+    memcpy(param.devID,   g_rtk_ctx.config.device_id,   strlen(g_rtk_ctx.config.device_id));
+    memcpy(param.devType, g_rtk_ctx.config.device_type, strlen(g_rtk_ctx.config.device_type));
+    param.timeout         = (unsigned int)g_rtk_ctx.config.timeout_sec;
+    param.sockIOBlockFlag = SIXENTS_SOCK_IOFLAG_NOBLOCK;
+    param.logPrintLevel   = SIXENTS_LL_DEBUG;
+    param.cbGetDiffData   = (sixents_cbGetDiffData)rtk_sixents_diff_callback;
+    param.cbGetStatus     = (sixents_cbGetStatus)rtk_sixents_status_callback;
+    param.cbTrace         = (sixents_cbTrace)rtk_sixents_log_callback;
+
+    /* ========================================================================
+     * 外层重连循环：断线后退避等待，然后重新 Init + Start
+     * ====================================================================== */
+    while (g_rtk_ctx.worker_running) {
+
+        /* 重连退避等待（首次连接跳过） */
+        if (reconnect_count > 0) {
+            uint32_t delay_ms = calc_backoff_ms(reconnect_count);
+            RTK_LOGI("第 %d 次重连，退避等待 %u ms (%.1f s)...",
+                     reconnect_count, delay_ms, delay_ms / 1000.0f);
+            sleep_interruptible(delay_ms);
+            if (!g_rtk_ctx.worker_running) break;
+        }
+
+        /* 更新状态为 CONNECTING */
+        pthread_mutex_lock(&g_rtk_ctx.state_mutex);
+        g_rtk_ctx.state = RTK_STATE_CONNECTING;
+        pthread_mutex_unlock(&g_rtk_ctx.state_mutex);
+        if (reconnect_count > 0) {
+            rtk_dispatch_status(RTK_STATE_CONNECTING, 0);
+        }
+
+        /* 初始化六分SDK */
+        ret = sixents_sdkInit(&param);
+        if (ret != SIXENTS_RET_OK) {
+            RTK_LOGE("六分SDK初始化失败: %d", ret);
+            sixents_sdkFinal();
+            rtk_dispatch_error(RTK_ERR_SIXENTS_INIT, "六分SDK初始化失败", 1);
+            reconnect_count++;
+            continue;
+        }
+        g_rtk_ctx.sixents_init = 1;
+        RTK_LOGI("六分SDK初始化成功");
+
+        /* 启动六分SDK */
+        ret = sixents_sdkStart();
+        if (ret != SIXENTS_RET_OK) {
+            RTK_LOGE("六分SDK启动失败: %d", ret);
+            sixents_cleanup();
+            rtk_dispatch_error(RTK_ERR_SIXENTS_START, "六分SDK启动失败", 1);
+            reconnect_count++;
+            continue;
+        }
+        g_rtk_ctx.sixents_started = 1;
+        RTK_LOGI("六分SDK启动成功");
+
+        /* 连接成功：重置计数，更新状态，清除错误 */
+        reconnect_count = 0;
+        last_gga_time   = 0;
+
+        pthread_mutex_lock(&g_rtk_ctx.state_mutex);
+        g_rtk_ctx.state = RTK_STATE_RUNNING;
+        pthread_mutex_unlock(&g_rtk_ctx.state_mutex);
+
+        pthread_mutex_lock(&g_rtk_ctx.callback_mutex);
+        g_rtk_ctx.last_error_code    = 0;
+        g_rtk_ctx.last_error_msg[0]  = '\0';
+        pthread_mutex_unlock(&g_rtk_ctx.callback_mutex);
+
+        rtk_dispatch_status(RTK_STATE_RUNNING, 0);
+        RTK_LOGI("差分服务连接成功，进入运行状态");
+
+        /* ====================================================================
+         * 内层主循环：驱动SDK、定时发GGA、监控连接健康
+         * ================================================================== */
+        int tick_error_count = 0;
+        int need_reconnect   = 0;
+
+        while (g_rtk_ctx.worker_running && !need_reconnect) {
+            rtk_sleep_ms(RTK_TICK_INTERVAL_MS);
+
+            /* 定时发送GGA */
+            uint64_t now = rtk_get_time_ms();
+            if (now - last_gga_time >= RTK_GGA_INTERVAL_MS) {
+                pthread_mutex_lock(&g_rtk_ctx.gga_mutex);
+                if (g_rtk_ctx.gga_ready && g_rtk_ctx.gga_len > 0) {
+                    ret = sixents_sdkSendGGAStr(g_rtk_ctx.gga_buffer,
+                                                (unsigned short)g_rtk_ctx.gga_len);
+                    if (ret == SIXENTS_RET_OK) {
+                        g_rtk_ctx.gga_send_count++;
+                        RTK_LOGD("发送GGA成功");
+                    } else {
+                        RTK_LOGW("发送GGA失败: %d", ret);
+                    }
+                }
+                pthread_mutex_unlock(&g_rtk_ctx.gga_mutex);
+                last_gga_time = now;
+            }
+
+            /* 驱动SDK，连续失败则触发重连 */
+            ret = sixents_sdkTick();
+            if (ret != SIXENTS_RET_OK) {
+                tick_error_count++;
+                RTK_LOGW("sixents_sdkTick失败: %d (连续 %d 次)", ret, tick_error_count);
+                if (tick_error_count >= RTK_TICK_ERROR_THRESHOLD) {
+                    RTK_LOGE("Tick连续失败 %d 次，触发重连", tick_error_count);
+                    rtk_dispatch_error(RTK_ERR_CONNECT_FAILED, "差分服务连接异常，正在重连", 1);
+                    reconnect_count++;
+                    need_reconnect = 1;
+                }
+            } else {
+                tick_error_count = 0;
+            }
+        }
+
+        /* 停止SDK，准备重连（或退出） */
+        sixents_cleanup();
+
+        if (g_rtk_ctx.worker_running && need_reconnect) {
+            RTK_LOGI("差分服务断开，准备第 %d 次重连", reconnect_count);
+            pthread_mutex_lock(&g_rtk_ctx.state_mutex);
+            g_rtk_ctx.state = RTK_STATE_CONNECTING;
+            pthread_mutex_unlock(&g_rtk_ctx.state_mutex);
+        }
+    }
+
+    /* 线程退出时确保资源释放 */
+    sixents_cleanup();
+
     RTK_LOGI("工作线程退出");
     return NULL;
 }

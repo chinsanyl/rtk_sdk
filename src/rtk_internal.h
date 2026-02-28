@@ -17,9 +17,14 @@
  * ========================================================================== */
 #define RTK_TICK_INTERVAL_MS            200     /* SDK Tick间隔（毫秒） */
 #define RTK_GGA_INTERVAL_MS             1000    /* GGA发送间隔（毫秒） */
-#define RTK_RECONNECT_DELAY_MS          3000    /* 重连延迟（毫秒） */
-#define RTK_MAX_RETRY_COUNT             5       /* 最大重试次数 */
-#define RTK_GPS_HEARTBEAT_INTERVAL_MS   5000    /* GPS串口断开时心跳广播间隔（毫秒） */
+#define RTK_GPS_HEARTBEAT_INTERVAL_MS   5000    /* GPS串口断开/无数据时心跳广播间隔（毫秒） */
+#define RTK_GPS_NO_DATA_TIMEOUT_MS      10000   /* GPS串口正常但模块无数据超时（毫秒），触发gps_state=3 */
+
+/* 差分服务器重连退避参数（delay = BASE * FACTOR^(n-1)，上限 MAX） */
+#define RTK_RECONNECT_BASE_MS           3000    /* 首次重连等待时间（毫秒） */
+#define RTK_RECONNECT_FACTOR            160     /* 每次增长倍率（160 = ×1.6，整数计算） */
+#define RTK_RECONNECT_MAX_MS            10800000/* 最长重连等待时间（毫秒，3小时） */
+#define RTK_TICK_ERROR_THRESHOLD        10      /* 连续Tick失败次数阈值，触发重连 */
 
 /* ============================================================================
  * 内部数据结构
