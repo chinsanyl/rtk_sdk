@@ -4,7 +4,7 @@ build/
 *.d
 *.a.local
 rtk_service
-rtk_service_*
+/rtk_service_*
 
 # Compiled binaries (keep thirdparty libs)
 # *.so
