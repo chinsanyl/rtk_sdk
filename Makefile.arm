@@ -1,0 +1,103 @@
+# RTK SDK ARM交叉编译Makefile
+# 用于aarch64-linux-gnu目标平台
+
+# 交叉编译工具链
+CROSS_COMPILE ?= aarch64-linux-gnu-
+CC := $(CROSS_COMPILE)gcc
+AR := $(CROSS_COMPILE)ar
+STRIP := $(CROSS_COMPILE)strip
+
+# 目录设置
+TOP_DIR := $(shell pwd)
+SRC_DIR := $(TOP_DIR)/src
+INC_DIR := $(TOP_DIR)/include
+MAIN_DIR := $(TOP_DIR)/main
+BUILD_DIR := $(TOP_DIR)/build-arm
+LIB_DIR := $(TOP_DIR)/lib-arm
+
+# 六分SDK路径（内置于thirdparty目录）
+SIXENTS_SDK_DIR := $(TOP_DIR)/thirdparty/sixents
+SIXENTS_INC_DIR := $(SIXENTS_SDK_DIR)/inc
+SIXENTS_LIB_DIR := $(SIXENTS_SDK_DIR)/lib
+
+# 编译选项
+CFLAGS := -Wall -Wextra -O2 -fPIC
+CFLAGS += -I$(INC_DIR) -I$(SRC_DIR) -I$(SIXENTS_INC_DIR)
+
+# ARM特定选项
+CFLAGS += -march=armv8-a
+
+# 链接选项（静态链接六分SDK）
+LDFLAGS := -L$(SIXENTS_LIB_DIR)
+LDFLAGS += -Wl,-Bstatic -lsixents-core-sdk
+LDFLAGS += -Wl,-Bdynamic -lpthread -lm
+
+# 源文件
+SRCS := $(SRC_DIR)/rtk_core.c \
+        $(SRC_DIR)/rtk_log.c \
+        $(SRC_DIR)/rtk_gga.c \
+        $(SRC_DIR)/rtk_broadcast.c \
+        $(SRC_DIR)/rtk_config.c \
+        $(SRC_DIR)/rtk_serial.c \
+        $(SRC_DIR)/rtk_gps_worker.c
+
+MAIN_SRC := $(MAIN_DIR)/rtk_main.c
+
+# 目标文件
+OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
+MAIN_OBJ := $(BUILD_DIR)/rtk_main.o
+
+# 输出文件
+SHARED_LIB := $(LIB_DIR)/librtk_sdk.so
+STATIC_LIB := $(LIB_DIR)/librtk_sdk.a
+EXECUTABLE := $(BUILD_DIR)/rtk_service
+
+# 默认目标
+.PHONY: all clean dirs lib service strip
+
+all: dirs lib service
+
+dirs:
+	@mkdir -p $(BUILD_DIR)
+	@mkdir -p $(LIB_DIR)
+
+lib: dirs $(SHARED_LIB) $(STATIC_LIB)
+
+service: dirs $(EXECUTABLE)
+
+# strip符号表（减小体积）
+strip: all
+	$(STRIP) $(SHARED_LIB)
+	$(STRIP) $(EXECUTABLE)
+
+$(SHARED_LIB): $(OBJS)
+	@echo "[ARM] 链接动态库: $@"
+	$(CC) -shared -o $@ $^ $(LDFLAGS)
+
+$(STATIC_LIB): $(OBJS)
+	@echo "[ARM] 创建静态库: $@"
+	$(AR) rcs $@ $^
+
+$(EXECUTABLE): $(MAIN_OBJ) $(OBJS)
+	@echo "[ARM] 链接可执行文件: $@"
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
+	@echo "[ARM] 编译: $<"
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/rtk_main.o: $(MAIN_DIR)/rtk_main.c
+	@echo "[ARM] 编译: $<"
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	@echo "清理ARM构建..."
+	rm -rf $(BUILD_DIR) $(LIB_DIR)
+
+info:
+	@echo "RTK SDK ARM交叉编译配置"
+	@echo "======================="
+	@echo "交叉编译器: $(CC)"
+	@echo "六分SDK: $(SIXENTS_SDK_DIR)"
+	@echo "输出目录: $(BUILD_DIR)"
+	@echo "库目录: $(LIB_DIR)"

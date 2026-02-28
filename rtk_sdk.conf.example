@@ -1,0 +1,47 @@
+# RTK SDK配置文件示例
+# 文件格式: INI
+
+[auth]
+# 鉴权AK（必填）
+ak = 0070157933
+
+# 鉴权AS（必填）
+as = jusa4id26nr8se7695uzmt7baiyqgayup52v1dpne77r4bpih9b8xar6yk6b83w7
+
+# 设备ID（必填）- 建议使用设备唯一标识如SN号
+device_id = DevRTCMSixEntsTest000001
+
+# 设备类型（必填）
+device_type = TypeRTCMSixEnts
+
+[network]
+# 网络超时时间（秒），范围1-60，默认10
+timeout = 10
+
+# 是否使用HTTPS，0=HTTP, 1=HTTPS
+use_https = 0
+
+[broadcast]
+# UDP广播端口，默认9000
+port = 9000
+
+# 广播地址，默认255.255.255.255
+address = 255.255.255.255
+
+[log]
+# 日志级别: 0=关闭, 1=错误, 2=警告, 3=信息, 4=调试
+level = 3
+
+# 日志文件路径，为空则只输出到控制台
+# file = /var/log/rtk_sdk.log
+
+[gps_serial]
+# GPS串口设备路径（必填，启用自动模式）
+port = /dev/ttyUSB0
+
+# 波特率，默认115200
+baudrate = 115200
+
+# 自动模式：自动读取GPS数据、发送差分数据、广播定位结果
+# 0=禁用（需手动调用API输入GGA），1=启用
+auto_mode = 1
