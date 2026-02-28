@@ -9,22 +9,28 @@ RTK SDK是基于六分科技差分SDK封装的高精度定位库，支持获取R
 ```
 rtk_sdk/
 ├── include/
-│   └── rtk_sdk.h           # 公开API头文件
+│   └── rtk_sdk.h               # 公开API头文件
 ├── src/
-│   ├── rtk_core.c          # 核心引擎
-│   ├── rtk_log.c           # 日志模块
-│   ├── rtk_gga.c           # GGA处理
-│   ├── rtk_broadcast.c     # UDP广播
-│   ├── rtk_config.c        # 配置解析
-│   └── rtk_internal.h      # 内部头文件
+│   ├── rtk_core.c              # 核心引擎（差分SDK封装+自动重连）
+│   ├── rtk_gps_worker.c        # GPS串口自动模式工作线程
+│   ├── rtk_serial.c/h          # GPS串口驱动（读写+NMEA解析）
+│   ├── rtk_log.c               # 日志模块
+│   ├── rtk_gga.c               # GGA处理
+│   ├── rtk_broadcast.c         # UDP广播
+│   ├── rtk_config.c            # 配置解析
+│   └── rtk_internal.h          # 内部头文件
 ├── main/
-│   └── rtk_main.c          # 进程入口
+│   └── rtk_main.c              # 进程入口
 ├── doc/
-│   ├── API.md              # API文档
-│   └── README.md           # 本文件
-├── Makefile                # 构建脚本
-├── Makefile.arm            # ARM交叉编译
-└── rtk_sdk.conf.example    # 配置示例
+│   ├── README.md               # 本文件
+│   ├── API.md                  # API参考手册
+│   ├── RTK_Service_Process_Guide.md  # 独立进程使用指南
+│   ├── RTK_SDK_Architecture.md # 架构与状态机分析
+│   └── RTK_SDK_FileMap.md      # 文件作用说明
+├── Makefile                    # 构建脚本
+├── Makefile.arm                # ARM交叉编译
+├── CHANGELOG.md                # 版本变更记录
+└── rtk_sdk.conf.example        # 配置示例
 ```
 
 ## 编译
@@ -110,32 +116,23 @@ int main() {
 
 ## UDP广播协议
 
-进程模式下，RTK SDK通过UDP广播发送RTCM差分数据：
+进程模式下，RTK SDK通过UDP广播发送两类数据：
 
-- **协议**：UDP广播
-- **默认端口**：9000
-- **默认地址**：255.255.255.255
-- **数据格式**：原始RTCM3二进制数据
+- **协议**：UDP广播，端口 9000，地址 255.255.255.255
+- **首字节 `0xD3`**：RTCM3 原始差分数据，直接透传给 GPS 模块
+- **首字节 `{`**：JSON 定位状态包，始终广播（含 fix=0 和串口断开时的心跳）
 
-### 接收端示例
-```c
-int sock = socket(AF_INET, SOCK_DGRAM, 0);
-struct sockaddr_in addr = {
-    .sin_family = AF_INET,
-    .sin_port = htons(9000),
-    .sin_addr.s_addr = INADDR_ANY
-};
-bind(sock, (struct sockaddr*)&addr, sizeof(addr));
+### JSON 包关键字段
 
-uint8_t buf[2048];
-while (1) {
-    int len = recvfrom(sock, buf, sizeof(buf), 0, NULL, NULL);
-    if (len > 0) {
-        // 收到RTCM数据
-        send_to_gps_module(buf, len);
-    }
-}
-```
+| 字段 | 说明 |
+|------|------|
+| `diff_state` | 差分服务状态（0未启动 1连接中 2运行中 3错误） |
+| `diff_err_msg` | 差分失败原因，正常时为空字符串 |
+| `gps_state` | GPS状态（0串口断开 1搜星中 2有定位 3模块静默故障） |
+| `fix` | 定位质量（4=RTK固定解，厘米级） |
+| `lat/lon/alt` | 纬度/经度/高度（WGS-84） |
+
+> 详细协议说明见 [RTK_Service_Process_Guide.md](RTK_Service_Process_Guide.md)
 
 ## 常见问题
 

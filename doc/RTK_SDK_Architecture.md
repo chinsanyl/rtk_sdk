@@ -1,8 +1,8 @@
 # RTK SDK 架构分析：工作流与状态机
 
-> **文档版本**: v1.0.0
+> **文档版本**: v1.1.0
 > **更新日期**: 2026-02-28
-> **适用 SDK 版本**: 1.1.0
+> **适用 SDK 版本**: 1.2.0
 
 ---
 
@@ -83,22 +83,31 @@ main()
 ```
 rtk_worker_thread()
   │
-  ├─ A. 初始化六分SDK（最多重试 5 次，间隔 3s）
-  │      sixents_sdkInit()
-  │      失败 → 重试 → 达到上限 → 线程退出
-  │
-  ├─ B. 启动六分SDK（最多重试 5 次，间隔 3s）
-  │      sixents_sdkStart()
-  │      成功 → 状态: CONNECTING → RUNNING，清除错误信息
-  │      失败 → 重试 → 达到上限 → 线程退出
-  │
-  └─ C. 主循环（每 200ms Tick 一次）
-         ├─ 每 200ms: sixents_sdkTick()   驱动六分SDK内部状态机
-         └─ 每 1000ms: sixents_sdkSendGGAStr()  上报 GGA 到云端
+  └─ 外层重连循环（无限，直到 worker_running=0）
+       │
+       ├─ [reconnect_count > 0] → calc_backoff_ms() 计算等待时间，sleep_interruptible()
+       │      退避公式: delay = BASE(3s) × FACTOR(1.6)^(n-1)，上限 3 小时
+       │
+       ├─ A. 状态 → CONNECTING
+       │
+       ├─ B. sixents_sdkInit()
+       │      失败 → dispatch_error()，reconnect_count++，continue 外层循环
+       │
+       ├─ C. sixents_sdkStart()
+       │      失败 → sixents_cleanup()，dispatch_error()，reconnect_count++，continue
+       │      成功 → reconnect_count=0，状态 → RUNNING，清除 last_error_msg
+       │
+       └─ D. 内层主循环（每 200ms Tick 一次）
+              ├─ 每 200ms: sixents_sdkTick()   驱动六分SDK内部状态机
+              │      失败计数 tick_errors++，达到 RTK_TICK_ERROR_THRESHOLD(10) →
+              │            need_reconnect=1，跳出内层循环
+              └─ 每 1000ms: sixents_sdkSendGGAStr()  上报 GGA 到云端
 
-         ※ 六分SDK通过回调推送数据：
-           - rtk_sixents_diff_callback()  ← 收到 RTCM 差分数据
-           - rtk_sixents_status_callback() ← 收到状态码
+              ※ 六分SDK通过回调推送数据：
+                - rtk_sixents_diff_callback()  ← 收到 RTCM 差分数据
+                - rtk_sixents_status_callback() ← 收到状态码
+
+              内层循环退出 → sixents_cleanup()，reconnect_count++，继续外层循环
 ```
 
 ### 2.3 GPS 工作线程（gps_worker_thread）流程
@@ -109,20 +118,26 @@ gps_worker_thread()
   └─ 主循环:
        │
        ├─ [串口状态 = ERROR]
-       │    ├─ 若距上次广播 ≥ 5s → broadcast_heartbeat() (gps_state=0)
-       │    └─ rtk_serial_reconnect() → 重连成功继续，失败 sleep 后重试
+       │    ├─ 若距上次广播 ≥ 5s → broadcast_heartbeat(0) (gps_state=0)
+       │    └─ rtk_serial_reconnect()
+       │         成功 → 重置 last_nmea_time（给模块10s启动缓冲），继续
+       │         失败 → reconnect_count++，sleep(2s)，继续
        │
        ├─ [串口状态 ≠ OPEN]
-       │    ├─ 若距上次广播 ≥ 5s → broadcast_heartbeat() (gps_state=0)
+       │    ├─ 若距上次广播 ≥ 5s → broadcast_heartbeat(0) (gps_state=0)
        │    └─ sleep(100ms) → 继续
        │
        └─ [串口状态 = OPEN]
+            ├─ [GPS模块静默检测] 若 now-last_nmea_time ≥ 10s 且距上次广播 ≥ 5s
+            │    └─ broadcast_heartbeat(3)  (gps_state=3)
+            │
             ├─ rtk_serial_read()       读取串口原始数据（100ms 超时）
             ├─ extract_nmea_sentence() 从缓冲区提取完整 NMEA 语句
             └─ [检测到 GGA 语句]
                  ├─ rtk_serial_parse_nmea()  解析 → 获取 fix, lat, lon 等
                  ├─ [fix > 0] → rtk_sdk_input_gga() 上报给差分SDK
-                 └─ broadcast_position()  → UDP 广播（无论 fix 是否为 0）
+                 ├─ broadcast_position()  → UDP 广播（无论 fix 是否为 0）
+                 └─ last_nmea_time = now  （更新GPS模块活跃时间戳）
 ```
 
 ### 2.4 RTCM 数据回路
@@ -182,11 +197,12 @@ rtk_broadcast_send()          rtk_gps_on_rtcm_data()
 
 ### 3.2 UDP 广播内容
 
-| 场景 | 广播内容 | 首字节 |
-|------|---------|--------|
-| 收到 RTCM | 原始 RTCM 二进制 | `0xD3` |
-| GPS 有数据（任意 fix） | JSON 定位包 | `{` |
-| GPS 串口断开（5s 一次）| JSON 心跳包（gps_state=0） | `{` |
+| 场景 | 广播内容 | 首字节 | gps_state |
+|------|---------|--------|-----------|
+| 收到 RTCM | 原始 RTCM 二进制 | `0xD3` | - |
+| GPS 有数据（任意 fix） | JSON 定位包 | `{` | 1 或 2 |
+| GPS 串口断开/重连中（5s 一次）| JSON 心跳包 | `{` | 0 |
+| GPS 串口正常但模块静默 >10s（5s 一次）| JSON 心跳包 | `{` | 3 |
 
 ---
 
@@ -225,7 +241,8 @@ rtk_broadcast_send()          rtk_gps_on_rtcm_data()
 | IDLE | `rtk_sdk_init()` 成功 | INIT |
 | INIT | `rtk_sdk_start()` 调用 | CONNECTING |
 | CONNECTING | `sixents_sdkStart()` 成功 | RUNNING |
-| CONNECTING | 重试 5 次失败 | 线程退出（状态未变） |
+| CONNECTING | Init/Start 失败 | CONNECTING（退避后重试，无上限） |
+| RUNNING | `sixents_sdkTick()` 连续失败 ≥10 次 | CONNECTING（触发重连） |
 | RUNNING | `rtk_sdk_stop()` 调用 | STOPPING |
 | STOPPING | 线程退出完成 | INIT |
 | INIT | `rtk_sdk_deinit()` | IDLE |
@@ -262,8 +279,9 @@ rtk_broadcast_send()          rtk_gps_on_rtcm_data()
 | 参数 | 值 | 说明 |
 |------|-----|------|
 | `RTK_SERIAL_RECONNECT_DELAY_MS` | 2000ms | 重连前等待时间 |
-| `RTK_SERIAL_MAX_RECONNECT_COUNT` | 5 次 | 最大重连次数 |
+| `RTK_SERIAL_MAX_RECONNECT_COUNT` | **20 次** | 最大重连次数（v1.2.0 由 5 增至 20） |
 | `RTK_SERIAL_ERROR_THRESHOLD` | 3 次 | 触发错误状态的连续错误阈值 |
+| `RTK_GPS_NO_DATA_TIMEOUT_MS` | 10000ms | GPS 模块静默检测阈值（gps_state=3）|
 
 ### 4.3 UDP 广播状态（diff_state 字段）
 
@@ -309,60 +327,84 @@ rtk_broadcast_send()          rtk_gps_on_rtcm_data()
 
 ## 6. 重连机制分析
 
-### 6.1 GPS 串口重连（✅ 有自动重连）
+### 6.1 GPS 串口重连（✅ 有自动重连 + GPS 模块静默检测）
 
 由 `gps_worker_thread` 驱动：
 
 ```
 检测到 RTK_SERIAL_STATE_ERROR
     │
-    ├─ 广播心跳（gps_state=0）
+    ├─ 广播心跳（gps_state=0，每 5s）
     └─ rtk_serial_reconnect()
          ├─ 关闭旧 fd
          ├─ 等待 2000ms
          ├─ serial_open_internal() 重新打开
-         └─ 成功 → OPEN，失败 → 继续 ERROR，sleep 后重试
+         ├─ 成功 → OPEN，重置 last_nmea_time，继续
+         └─ 失败 → 继续 ERROR，sleep 后重试（最多 20 次）
+
+串口 OPEN 但 GPS 模块超过 10 秒无 NMEA 输出
+    │
+    └─ 广播心跳（gps_state=3，每 5s）
+         触发场景：模块掉电、固件崩溃、波特率不匹配
+         收到 NMEA 后自动恢复正常广播
 ```
 
-### 6.2 差分服务器重连（⚠️ 仅初始连接有重试，运行中无重连）
+**GPS 串口重连参数**：
 
-**初始连接**（`rtk_worker_thread` 启动阶段）：
-- `sixents_sdkInit()`: 失败重试，最多 5 次，间隔 3s
-- `sixents_sdkStart()`: 失败重试，最多 5 次，间隔 3s
-- 5 次失败后：线程退出，进程继续运行但差分服务停止
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `RTK_SERIAL_ERROR_THRESHOLD` | 3 次 | 连续读写错误触发 ERROR |
+| `RTK_SERIAL_RECONNECT_DELAY_MS` | 2000ms | 重连等待时间（固定） |
+| `RTK_SERIAL_MAX_RECONNECT_COUNT` | 20 次 | 最大重连次数 |
+| `RTK_GPS_NO_DATA_TIMEOUT_MS` | 10000ms | 模块静默触发 gps_state=3 |
+| `RTK_GPS_HEARTBEAT_INTERVAL_MS` | 5000ms | 心跳广播间隔 |
 
-**运行中断线**（主循环阶段）：
-- `sixents_sdkTick()` 失败 → 仅打印警告，**无重连触发**
-- 六分SDK 内部可能有自己的保活机制，但 RTK SDK 层面**不感知也不处理**
+### 6.2 差分服务器重连（✅ 有自动重连 + 指数退避，v1.2.0 新增）
 
-**影响与建议**：
+**统一外层重连循环**（`rtk_worker_thread`）：
 
-| 场景 | 当前行为 | 建议处理 |
-|------|---------|---------|
-| 初始连接失败 | 重试 5 次后线程退出，进程继续 | 外部 watchdog 检测超时后重启进程 |
-| 运行中断网 | 等待六分SDK超时回调（60s）后报错 | 外部 watchdog 检测 60s 无 RTCM 后重启 |
-| 断网恢复 | 无法自动恢复 | kill + restart rtk_service |
-
-**外部 watchdog 建议逻辑**：
-
-```bash
-#!/bin/bash
-while true; do
-    ./rtk_service -c rtk_sdk.conf &
-    PID=$!
-
-    # 监控 UDP 心跳，超过 60s 无数据则重启
-    LAST_PKT=$(date +%s)
-    while kill -0 $PID 2>/dev/null; do
-        NOW=$(date +%s)
-        if [ $((NOW - LAST_PKT)) -gt 60 ]; then
-            echo "超时无数据，重启服务"
-            kill $PID
-            break
-        fi
-        sleep 5
-    done
-
-    sleep 3  # 重启前等待
-done
 ```
+外层循环（无限重试，除非 worker_running=0）
+  │
+  ├─ [reconnect_count > 0] 先等待退避时间
+  │      delay = RTK_RECONNECT_BASE_MS × (RTK_RECONNECT_FACTOR/100)^(n-1)
+  │             = 3000 × 1.6^(n-1)，上限 10800000ms（3 小时）
+  │      等待期间每 200ms 检查一次是否需要退出
+  │
+  ├─ sixents_sdkInit() 失败
+  │      → dispatch_error()，reconnect_count++，退避后重试
+  │
+  ├─ sixents_sdkStart() 失败
+  │      → sixents_cleanup()，dispatch_error()，reconnect_count++，退避后重试
+  │
+  ├─ 成功启动 → reconnect_count=0，状态 RUNNING，清除 last_error_msg
+  │
+  └─ 内层 Tick 循环
+       ├─ sixents_sdkTick() 连续失败 ≥ 10 次（RTK_TICK_ERROR_THRESHOLD）
+       │      → need_reconnect=1，跳出内层循环
+       └─ 内层退出 → sixents_cleanup()，reconnect_count++，回到外层等待
+```
+
+**退避时间参考**（BASE=3s，FACTOR=×1.6）：
+
+| 重连次数 | 等待时间 |
+|---------|---------|
+| 第 1 次 | 0s（立即） |
+| 第 2 次 | 3s |
+| 第 3 次 | ≈4.8s |
+| 第 4 次 | ≈7.7s |
+| 第 5 次 | ≈12.3s |
+| 第 10 次 | ≈77s |
+| 第 15 次 | ≈39min |
+| 第 20 次+ | 3 小时（封顶） |
+
+> kill 进程后重启，重连计数从 0 开始，无历史累积。
+
+**差分重连参数**（宏定义，修改后重新编译生效）：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `RTK_RECONNECT_BASE_MS` | 3000ms | 首次重连等待时间 |
+| `RTK_RECONNECT_FACTOR` | 160 | 退避倍率（/100 = ×1.6） |
+| `RTK_RECONNECT_MAX_MS` | 10800000ms | 最长等待时间（3 小时） |
+| `RTK_TICK_ERROR_THRESHOLD` | 10 次 | 触发重连的连续 Tick 失败阈值 |
