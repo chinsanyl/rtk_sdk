@@ -124,7 +124,6 @@ static int get_diff_state(void) {
  * @brief 广播定位结果（JSON格式，包含差分状态和GPS状态字段）
  *
  * 新增字段说明:
- *   src        - 数据来源，与 fix 值相同（0无效 1单点 2差分 4RTK固定 5RTK浮动）
  *   diff_state - 差分服务状态（0未启动 1连接中 2运行中 3错误）
  *   diff_err_msg - 差分失败原因，正常时为空字符串
  *   gps_state  - GPS串口状态（1已连接无信号 2已连接有定位数据）
@@ -146,7 +145,6 @@ static void broadcast_position(const rtk_position_t *pos) {
     int len = snprintf(json, sizeof(json),
         "{"
         "\"type\":\"rtk_position\","
-        "\"src\":%d,"
         "\"diff_state\":%d,"
         "\"diff_err_msg\":\"%s\","
         "\"gps_state\":%d,"
@@ -158,7 +156,6 @@ static void broadcast_position(const rtk_position_t *pos) {
         "\"sat\":%d,"
         "\"ts\":%llu"
         "}",
-        pos->fix_quality,
         get_diff_state(),
         diff_err_msg,
         gps_state,
@@ -202,7 +199,6 @@ static void broadcast_heartbeat(void) {
     int len = snprintf(json, sizeof(json),
         "{"
         "\"type\":\"rtk_position\","
-        "\"src\":0,"
         "\"diff_state\":%d,"
         "\"diff_err_msg\":\"%s\","
         "\"gps_state\":0,"
